@@ -69,7 +69,8 @@ NUM_GPUS_PER_PROCESS=4
 pkill -9 -c -f allgather_test
 rm -f allgather_test_uid.bin zz*.log
 
-TEST=./build/examples/allgather_test
+TEST=./build/examples/all2all_test
+#TEST=./build/examples/allgather_test
 # TEST=./build/examples/sdma_put_test
 for ((pid = 0; pid < $NUM_PROCS; pid++ )); do
   gpus=$(seq -s, $((pid*NUM_GPUS_PER_PROCESS)) $((pid*NUM_GPUS_PER_PROCESS+NUM_GPUS_PER_PROCESS-1)))
