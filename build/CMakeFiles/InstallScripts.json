@@ -1,0 +1,14 @@
+{
+	"InstallScripts" : 
+	[
+		"/sgl-workspace/mori/build/cmake_install.cmake",
+		"/sgl-workspace/mori/build/examples/cmake_install.cmake",
+		"/sgl-workspace/mori/build/src/application/cmake_install.cmake",
+		"/sgl-workspace/mori/build/src/shmem/cmake_install.cmake",
+		"/sgl-workspace/mori/build/src/ops/cmake_install.cmake",
+		"/sgl-workspace/mori/build/src/io/cmake_install.cmake",
+		"/sgl-workspace/mori/build/src/pybind/cmake_install.cmake",
+		"/sgl-workspace/mori/build/tests/cpp/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

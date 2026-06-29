@@ -1,0 +1,2 @@
+# Empty dependencies file for send_recv_gpu.
+# This may be replaced when dependencies are built.

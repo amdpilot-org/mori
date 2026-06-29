@@ -1,0 +1,2 @@
+/opt/rocm-7.2.0/lib/llvm/bin/llvm-ar qc libmori_shmem.a CMakeFiles/mori_shmem.dir/init.cpp.o CMakeFiles/mori_shmem.dir/memory.cpp.o
+/opt/rocm-7.2.0/lib/llvm/bin/llvm-ranlib libmori_shmem.a

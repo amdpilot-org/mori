@@ -1,0 +1,2 @@
+/opt/rocm-7.2.0/lib/llvm/bin/llvm-ar qc libmori_ops.a CMakeFiles/mori_ops.dir/dispatch_combine/dispatch_combine.cpp.o CMakeFiles/mori_ops.dir/dispatch_combine/internode_v1.cpp.o CMakeFiles/mori_ops.dir/dispatch_combine/low_latency_async.cpp.o CMakeFiles/mori_ops.dir/cast.cpp.o
+/opt/rocm-7.2.0/lib/llvm/bin/llvm-ranlib libmori_ops.a

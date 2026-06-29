@@ -1,0 +1,40 @@
+name: mori
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    name: mori build
+    runs-on: label-1
+    timeout-minutes: 10
+    steps:
+      - name: clone source code
+        run: |
+          cd mori
+          rm -rf build
+          git checkout ci-new
+          git pull
+          pip install -r requirements-build.txt
+          USE_IONIC=ON pip3 install . --no-build-isolation
+          scp -P 2233 -r /root/actions-runner/_work/mori/mori/mori root@smci355-ccs-aus-n08-33:/root/actions-runner/_work/mori/mori/
+  test:
+    name: mori test
+    needs: build
+    runs-on: label-1
+    timeout-minutes: 10
+    steps:
+      - name: Run tests
+        run: |
+          cd mori
+          export PYTHONPATH=/root/actions-runner/_work/mori/mori/mori:$PYTHONPATH
+          pytest ./tests/python/io/test_engine.py
+          pytest ./tests/python/io/test_engine_multi_session_batch.py
+          ./build/examples/write_gpu
+          ./build/examples/write_inline_gpu
+          ./build/examples/send_recv_gpu
+          mpiexec --allow-run-as-root -x MORI_GLOBAL_LOG_LEVEL=TRACE -np 2 ./build/examples/dist_write -c 4 -t 256 -q 4
+          pytest ./tests/python/shmem/test_api.py
+          mpiexec --allow-run-as-root -np 2 ./build/examples/concurrent_put_thread
+          mpiexec --allow-run-as-root -np 2 ./build/examples/concurrent_put_imm_thread
+          mpiexec --allow-run-as-root -np 2 ./build/examples/concurrent_put_signal_thread
+          pytest ./tests/python/ops/test_dispatch_combine.py
