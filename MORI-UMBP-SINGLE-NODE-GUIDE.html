@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>RDMA Bandwidth Utilization in Dispatch/Combine Kernels &mdash; MORI 0.1.0 documentation</title>
+  <title>MORI UMBP Single-Node Smoke Test &mdash; MORI 0.1.0 documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
@@ -345,9 +345,9 @@
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
       <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
-      <li class="breadcrumb-item active">RDMA Bandwidth Utilization in Dispatch/Combine Kernels</li>
+      <li class="breadcrumb-item active">MORI UMBP Single-Node Smoke Test</li>
       <li class="wy-breadcrumbs-aside">
-            <a href="_sources/rdma_bandwidth_utilization.md.txt" rel="nofollow"> View page source</a>
+            <a href="_sources/MORI-UMBP-SINGLE-NODE-GUIDE.md.txt" rel="nofollow"> View page source</a>
       </li>
   </ul>
   <hr/>
@@ -355,269 +355,234 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="rdma-bandwidth-utilization-in-dispatch-combine-kernels">
-<h1>RDMA Bandwidth Utilization in Dispatch/Combine Kernels<a class="headerlink" href="#rdma-bandwidth-utilization-in-dispatch-combine-kernels" title="Link to this heading"></a></h1>
+  <section id="mori-umbp-single-node-smoke-test">
+<h1>MORI UMBP Single-Node Smoke Test<a class="headerlink" href="#mori-umbp-single-node-smoke-test" title="Link to this heading"></a></h1>
+<p>This guide documents how to run the single-node UMBP + SGLang correctness smoke test that ships with Mori. The flow mirrors the <code class="docutils literal notranslate"><span class="pre">umbp-single-node-launcher</span></code> skill and launches the <a class="reference download internal" download="" href="_downloads/2a71e436c0b4c3535804f4dc53a137f5/run_umbp_single_node_hicache.sh"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">run_umbp_single_node_hicache.sh</span></code></span></a> helper script inside a ROCm container.</p>
+<p>Use the placeholders in this document to map the workflow to any target node. Every environment-dependent value is surfaced as an argument or environment variable; update those inputs and the script can run unchanged.</p>
+<p>For the underlying architecture see
+<span class="xref myst"><code class="docutils literal notranslate"><span class="pre">src/umbp/doc/design-master-control-plane.md</span></code></span>;
+for the full env-var inventory see
+<span class="xref myst"><code class="docutils literal notranslate"><span class="pre">src/umbp/doc/runtime-env-vars.md</span></code></span>.</p>
 <section id="overview">
 <h2>Overview<a class="headerlink" href="#overview" title="Link to this heading"></a></h2>
-<p>This document explains how RDMA bandwidth is used in the <code class="docutils literal notranslate"><span class="pre">internode_v1</span></code> (and <code class="docutils literal notranslate"><span class="pre">v1_ll</span></code>) dispatch/combine kernels, and how to measure or verify that the RDMA link is being driven at full capacity.</p>
+<p>The script spins up the Docker image, rebuilds Mori with UMBP enabled, launches a single-node SGLang server backed by UMBP hierarchical cache, issues a probe completion, and collects logs under <code class="docutils literal notranslate"><span class="pre">~/umbp_single_node_results</span></code>. It is intended as a fast health check for DP+EP configurations.</p>
 </section>
-<hr class="docutils" />
-<section id="kernel-execution-path">
-<h2>Kernel Execution Path<a class="headerlink" href="#kernel-execution-path" title="Link to this heading"></a></h2>
-<p>Each dispatch+combine iteration consists of the following phases (as seen in the profiler trace):</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>ep_dispatch_copy_to_staging          [serial, separate kernel]
-    ↓
-EpDispatchInterNodeV1Kernel          [one kernel launch, two block groups]
-  ├─ RDMA blocks (blockId &lt; rdmaBlockNum)
-  │     dispatch_inter_node_send     → fire RDMA puts to other nodes
-  │     dispatch_inter_node_recv     → poll flags, copy received tokens into XGMI mem
-  └─ XGMI blocks (blockId &gt;= rdmaBlockNum)
-        dispatch_intra               → direct XGMI writes to intra-node peers
-  [all blocks] dispatch_sync         → barrier, signal recv counts, shmem_quiet
-    ↓
-EpCombineSync                        [serial, separate kernel]
-    combine_sync                     → copy local expert outputs into combineInp staging;
-                                       accumulate routing weights; reset dispatch counters
-    ↓
-EpCombineSyncBarrier                 [serial, 1 block × 1 warp]
-    ep_combine_sync_barrier          → cross-device barrier via RDMA AMO to every peer node;
-                                       spins until all nodes acknowledge before combine starts
-    ↓
-EpCombineInterNodeV1Kernel           [one kernel launch, two block groups]
-  ├─ RDMA blocks
-  │     combine_inter_node           → poll flags, accumulate, RDMA-send results back
-  └─ XGMI blocks
-        combine_intra_node           → accumulate intra-node contributions
-    ↓
-EpCombineAll                         [serial, separate kernel]
-    ep_combine_all                   → final weighted accumulation across all nodes into output
-</pre></div>
-</div>
-<p>The low-latency variant (<code class="docutils literal notranslate"><span class="pre">v1_ll</span></code>) has the same structure but uses
-<code class="docutils literal notranslate"><span class="pre">dispatch_inter_node_ll_send</span></code> / <code class="docutils literal notranslate"><span class="pre">_ll_recv</span></code> / <code class="docutils literal notranslate"><span class="pre">combine_inter_node_ll</span></code> / <code class="docutils literal notranslate"><span class="pre">combine_intra_node_ll</span></code>.</p>
-</section>
-<hr class="docutils" />
-<section id="what-rdma-actually-transfers">
-<h2>What RDMA Actually Transfers<a class="headerlink" href="#what-rdma-actually-transfers" title="Link to this heading"></a></h2>
-<section id="dispatch-send-dispatchinternodesend-dispatchinternodellsend">
-<h3>Dispatch send (<code class="docutils literal notranslate"><span class="pre">DispatchInterNodeSend</span></code> / <code class="docutils literal notranslate"><span class="pre">DispatchInterNodeLLSend</span></code>)<a class="headerlink" href="#dispatch-send-dispatchinternodesend-dispatchinternodellsend" title="Link to this heading"></a></h3>
-<p>Each RDMA block iterates over chunks of <code class="docutils literal notranslate"><span class="pre">warpSize</span></code> (64) local tokens and fires one
-<code class="docutils literal notranslate"><span class="pre">ShmemPutMemNbiSignalThread</span></code> call per chunk per remote node:</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="nb">bytes</span> <span class="n">per</span> <span class="n">put</span> <span class="o">=</span> <span class="n">tokenNum</span> <span class="o">*</span> <span class="n">xferBytes</span>
-<span class="n">xferBytes</span>     <span class="o">=</span> <span class="n">hiddenBytes</span> <span class="o">+</span> <span class="n">indexBytes</span> <span class="o">+</span> <span class="n">weightBytes</span> <span class="o">+</span> <span class="n">scaleBytes</span> <span class="o">+</span> <span class="n">sizeof</span><span class="p">(</span><span class="n">index_t</span><span class="p">)</span>
-</pre></div>
-</div>
-<p>The put is a 1-sided non-blocking RDMA write + remote atomic signal. QP selection rotates
-across <code class="docutils literal notranslate"><span class="pre">numQpPerPe</span></code> queue pairs:</p>
-<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="kt">int</span><span class="w"> </span><span class="n">qpId</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">tokenId</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">warpSize</span><span class="p">)</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">config</span><span class="p">.</span><span class="n">numQpPerPe</span><span class="p">;</span>
-</pre></div>
-</div>
-<p>Total bytes injected per rank per iteration (dispatch direction):</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>dispatch_rdma_bytes = curRankNumToken × xferBytes × (nNodes - 1)
-</pre></div>
-</div>
-</section>
-<section id="combine-send-combineinternodetyped-combineinternodelltyped">
-<h3>Combine send (<code class="docutils literal notranslate"><span class="pre">CombineInterNodeTyped</span></code> / <code class="docutils literal notranslate"><span class="pre">CombineInterNodeLLTyped</span></code>)<a class="headerlink" href="#combine-send-combineinternodetyped-combineinternodelltyped" title="Link to this heading"></a></h3>
-<p>After accumulating the expert outputs, the combine RDMA blocks fire one
-<code class="docutils literal notranslate"><span class="pre">ShmemPutTypeNbiWarp</span></code> per completed chunk back to the originating node:</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="nb">bytes</span> <span class="n">per</span> <span class="n">put</span> <span class="o">=</span> <span class="n">thisChunkTokenNum</span> <span class="o">*</span> <span class="n">tokCombXferBytes</span>
-<span class="n">tokCombXferBytes</span> <span class="o">=</span> <span class="n">hiddenBytes</span>  <span class="p">(</span><span class="ow">or</span> <span class="n">fp8HiddenBytes</span> <span class="k">for</span> <span class="n">FP8</span> <span class="n">paths</span><span class="p">)</span>
-                 <span class="o">+</span> <span class="n">weightBytes</span>  <span class="p">(</span><span class="k">if</span> <span class="n">weightsBuf</span> <span class="o">!=</span> <span class="n">nullptr</span><span class="p">)</span>
-</pre></div>
-</div>
-<p>Total bytes per rank per iteration (combine direction):</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>combine_rdma_bytes = curRankNumToken × tokCombXferBytes × (nNodes - 1)
-</pre></div>
-</div>
-</section>
-</section>
-<hr class="docutils" />
-<section id="theoretical-peak-vs-observed-throughput">
-<h2>Theoretical Peak vs. Observed Throughput<a class="headerlink" href="#theoretical-peak-vs-observed-throughput" title="Link to this heading"></a></h2>
-<section id="computing-theoretical-peak">
-<h3>Computing theoretical peak<a class="headerlink" href="#computing-theoretical-peak" title="Link to this heading"></a></h3>
-<p>Given a profiler trace (times in microseconds):</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">dispatch_send_duration_us</span>   <span class="o">=</span> <span class="n">wall</span><span class="o">-</span><span class="n">clock</span> <span class="n">span</span> <span class="n">of</span> <span class="n">dispatch_inter_node_send</span>
-<span class="n">combine_inter_duration_us</span>   <span class="o">=</span> <span class="n">wall</span><span class="o">-</span><span class="n">clock</span> <span class="n">span</span> <span class="n">of</span> <span class="n">combine_inter_node</span>
-</pre></div>
-</div>
-<p>Theoretical RDMA throughput check:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Example calculation</span>
-<span class="n">hidden_dim</span>     <span class="o">=</span> <span class="mi">7168</span>            <span class="c1"># model hidden dim</span>
-<span class="n">dtype_bytes</span>    <span class="o">=</span> <span class="mi">2</span>               <span class="c1"># bf16</span>
-<span class="n">index_bytes</span>    <span class="o">=</span> <span class="n">topk</span> <span class="o">*</span> <span class="mi">4</span>       <span class="c1"># int32 per expert slot</span>
-<span class="n">weight_bytes</span>   <span class="o">=</span> <span class="n">topk</span> <span class="o">*</span> <span class="mi">4</span>       <span class="c1"># float32</span>
-<span class="n">scale_bytes</span>    <span class="o">=</span> <span class="n">scale_dim</span> <span class="o">*</span> <span class="n">scale_type_size</span>  <span class="c1"># optional</span>
-
-<span class="n">xfer_bytes_tok</span> <span class="o">=</span> <span class="n">hidden_dim</span> <span class="o">*</span> <span class="n">dtype_bytes</span> <span class="o">+</span> <span class="n">index_bytes</span> <span class="o">+</span> <span class="n">weight_bytes</span> <span class="o">+</span> <span class="n">scale_bytes</span> <span class="o">+</span> <span class="mi">4</span>
-
-<span class="n">total_send_bytes</span> <span class="o">=</span> <span class="n">cur_rank_num_token</span> <span class="o">*</span> <span class="n">xfer_bytes_tok</span> <span class="o">*</span> <span class="p">(</span><span class="n">n_nodes</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
-
-<span class="c1"># From trace</span>
-<span class="n">send_dur_sec</span> <span class="o">=</span> <span class="n">dispatch_send_duration_us</span> <span class="o">*</span> <span class="mf">1e-6</span>
-
-<span class="n">observed_bw_GBps</span> <span class="o">=</span> <span class="n">total_send_bytes</span> <span class="o">/</span> <span class="n">send_dur_sec</span> <span class="o">/</span> <span class="mf">1e9</span>
-
-<span class="c1"># Compare to link rating, e.g. 400 Gb/s = 50 GB/s per port</span>
-<span class="c1"># With numQpPerPe QPs the effective ceiling is still the NIC BW</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Observed RDMA send BW: </span><span class="si">{</span><span class="n">observed_bw_GBps</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GB/s"</span><span class="p">)</span>
-</pre></div>
-</div>
-</section>
-<section id="understanding-the-receive-side-timing">
-<h3>Understanding the receive-side timing<a class="headerlink" href="#understanding-the-receive-side-timing" title="Link to this heading"></a></h3>
-<p>The <code class="docutils literal notranslate"><span class="pre">dispatch_inter_node_recv</span></code> / <code class="docutils literal notranslate"><span class="pre">combine_inter_node</span></code> spans include both:</p>
-<ol class="arabic simple">
-<li><p><strong>Waiting (spinning)</strong> on <code class="docutils literal notranslate"><span class="pre">chunkFlag</span></code> or <code class="docutils literal notranslate"><span class="pre">nodeRecvTokenNum</span></code> flags until the remote data arrives.</p></li>
-<li><p><strong>Copying</strong> from the RDMA staging buffer into XGMI-accessible memory.</p></li>
-</ol>
-<p>A long <code class="docutils literal notranslate"><span class="pre">recv</span></code> span relative to the <code class="docutils literal notranslate"><span class="pre">send</span></code> span indicates the receiver is
-<strong>blocked waiting for data</strong> — the NIC/fabric is the bottleneck.
-A short <code class="docutils literal notranslate"><span class="pre">recv</span></code> span means the data arrived before or soon after the receiver started polling.</p>
-</section>
-</section>
-<hr class="docutils" />
-<section id="how-to-check-rdma-bandwidth-from-the-trace">
-<h2>How to Check RDMA Bandwidth from the Trace<a class="headerlink" href="#how-to-check-rdma-bandwidth-from-the-trace" title="Link to this heading"></a></h2>
-<section id="step-1-collect-a-profiler-trace">
-<h3>Step 1: Collect a profiler trace<a class="headerlink" href="#step-1-collect-a-profiler-trace" title="Link to this heading"></a></h3>
-<p>Enable the kernel profiler (requires <code class="docutils literal notranslate"><span class="pre">ENABLE_PROFILER</span></code> build flag) and run:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>analyze_trace_internode.py<span class="w"> </span>&lt;trace_rank_0_XXXXXX.json&gt;<span class="w"> </span>--out<span class="w"> </span>timeline.png
-</pre></div>
-</div>
-<p>The trace gives wall-clock spans for each kernel on each warp, merged into a
-single timeline per iteration.</p>
-</section>
-<section id="step-2-read-key-durations-from-the-text-summary">
-<h3>Step 2: Read key durations from the text summary<a class="headerlink" href="#step-2-read-key-durations-from-the-text-summary" title="Link to this heading"></a></h3>
-<p>The script prints:</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>Kernel                             start      end      dur
-dispatch_inter_node_send          0.00    120.00   120.00   ← RDMA send phase
-dispatch_inter_node_recv         10.00    350.00   340.00   ← poll + copy received tokens
-dispatch_intra                    0.00    180.00   180.00   ← concurrent XGMI
-dispatch_sync                   350.00    360.00    10.00   ← barrier + shmem_quiet
-combine_sync                    360.00    400.00    40.00   ← copy outputs into staging
-ep_combine_sync_barrier         400.00    420.00    20.00   ← cross-node AMO barrier
-combine_inter_node              420.00    760.00   340.00   ← RDMA combine (concurrent)
-combine_intra_node              420.00    560.00   140.00   ← XGMI combine (concurrent)
-ep_combine_all                  760.00    810.00    50.00   ← final accumulation
-</pre></div>
-</div>
-</section>
-<section id="step-3-compute-observed-rdma-bandwidth">
-<h3>Step 3: Compute observed RDMA bandwidth<a class="headerlink" href="#step-3-compute-observed-rdma-bandwidth" title="Link to this heading"></a></h3>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># Plug in values from your config and trace</span>
-<span class="n">send_dur_us</span>        <span class="o">=</span> <span class="mf">120.0</span>        <span class="c1"># dispatch_inter_node_send wall-clock span</span>
-<span class="n">combine_dur_us</span>     <span class="o">=</span> <span class="mf">340.0</span>        <span class="c1"># combine_inter_node wall-clock span</span>
-<span class="n">cur_rank_num_token</span> <span class="o">=</span> <span class="mi">2048</span>
-<span class="n">n_nodes</span>            <span class="o">=</span> <span class="mi">4</span>
-<span class="n">hidden_dim</span>         <span class="o">=</span> <span class="mi">7168</span>
-<span class="n">dtype_bytes</span>        <span class="o">=</span> <span class="mi">2</span>            <span class="c1"># bf16</span>
-<span class="n">topk</span>               <span class="o">=</span> <span class="mi">4</span>
-<span class="n">xfer_bytes_tok</span>     <span class="o">=</span> <span class="n">hidden_dim</span> <span class="o">*</span> <span class="n">dtype_bytes</span> <span class="o">+</span> <span class="n">topk</span> <span class="o">*</span> <span class="mi">4</span> <span class="o">+</span> <span class="n">topk</span> <span class="o">*</span> <span class="mi">4</span> <span class="o">+</span> <span class="mi">4</span>
-
-<span class="n">dispatch_bytes</span> <span class="o">=</span> <span class="n">cur_rank_num_token</span> <span class="o">*</span> <span class="n">xfer_bytes_tok</span> <span class="o">*</span> <span class="p">(</span><span class="n">n_nodes</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
-<span class="n">combine_bytes</span>  <span class="o">=</span> <span class="n">cur_rank_num_token</span> <span class="o">*</span> <span class="n">hidden_dim</span> <span class="o">*</span> <span class="n">dtype_bytes</span> <span class="o">*</span> <span class="p">(</span><span class="n">n_nodes</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
-
-<span class="n">dispatch_bw_GBps</span> <span class="o">=</span> <span class="n">dispatch_bytes</span> <span class="o">/</span> <span class="p">(</span><span class="n">send_dur_us</span> <span class="o">*</span> <span class="mf">1e-6</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e9</span>
-<span class="n">combine_bw_GBps</span>  <span class="o">=</span> <span class="n">combine_bytes</span>  <span class="o">/</span> <span class="p">(</span><span class="n">combine_dur_us</span> <span class="o">*</span> <span class="mf">1e-6</span><span class="p">)</span> <span class="o">/</span> <span class="mf">1e9</span>
-
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Dispatch RDMA BW: </span><span class="si">{</span><span class="n">dispatch_bw_GBps</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GB/s"</span><span class="p">)</span>
-<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Combine  RDMA BW: </span><span class="si">{</span><span class="n">combine_bw_GBps</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> GB/s"</span><span class="p">)</span>
-</pre></div>
-</div>
-</section>
-<section id="step-4-interpret-results">
-<h3>Step 4: Interpret results<a class="headerlink" href="#step-4-interpret-results" title="Link to this heading"></a></h3>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head"><p>Observation</p></th>
-<th class="head"><p>Likely cause</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">send_dur</span></code> ≈ <code class="docutils literal notranslate"><span class="pre">dispatch_bytes</span> <span class="pre">/</span> <span class="pre">NIC_BW</span></code></p></td>
-<td><p>Send side is BW-saturated (good)</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">recv_dur</span></code> &gt;&gt; <code class="docutils literal notranslate"><span class="pre">send_dur</span></code></p></td>
-<td><p>Receiver spins waiting; fabric or sender is the bottleneck</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">recv_dur</span></code> &lt;&lt; <code class="docutils literal notranslate"><span class="pre">send_dur</span></code></p></td>
-<td><p>Receiver catches up quickly; may be underloaded (small batch)</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">combine_inter_dur</span></code> &gt;&gt; <code class="docutils literal notranslate"><span class="pre">combine_rdma_bytes</span> <span class="pre">/</span> <span class="pre">NIC_BW</span></code></p></td>
-<td><p>Poll loop stall or NIC contention</p></td>
-</tr>
-<tr class="row-even"><td><p>Iteration time dominated by <code class="docutils literal notranslate"><span class="pre">dispatch_sync</span></code> or <code class="docutils literal notranslate"><span class="pre">combine_sync</span></code></p></td>
-<td><p>Barrier overhead, not BW</p></td>
-</tr>
-</tbody>
-</table>
-</section>
-</section>
-<hr class="docutils" />
-<section id="key-tuning-parameters-that-affect-rdma-utilization">
-<h2>Key Tuning Parameters That Affect RDMA Utilization<a class="headerlink" href="#key-tuning-parameters-that-affect-rdma-utilization" title="Link to this heading"></a></h2>
-<table class="docutils align-default">
-<thead>
-<tr class="row-odd"><th class="head"><p>Parameter</p></th>
-<th class="head"><p>Effect</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">rdmaBlockNum</span></code></p></td>
-<td><p>More RDMA blocks → more warps driving sends concurrently</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">numQpPerPe</span></code></p></td>
-<td><p>More QPs → more in-flight RDMA operations, reduces head-of-line blocking</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">curRankNumToken</span></code> (batch size)</p></td>
-<td><p>Larger batches → longer RDMA transfers → easier to saturate</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">xferBytes</span></code> (hidden dim, topk)</p></td>
-<td><p>Larger transfer size per token → higher bandwidth per put</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">warpSize</span></code>-aligned chunks</p></td>
-<td><p>Chunk size = 64 tokens; larger chunks = fewer puts with less overhead</p></td>
-</tr>
-</tbody>
-</table>
-<section id="v1-vs-v1-ll-low-latency-tradeoff">
-<h3>v1 vs. v1_ll (low-latency) tradeoff<a class="headerlink" href="#v1-vs-v1-ll-low-latency-tradeoff" title="Link to this heading"></a></h3>
+<section id="prerequisites">
+<h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading"></a></h2>
 <ul class="simple">
-<li><p><strong>v1</strong>: Each RDMA block handles a contiguous range of chunks per remote node. The recv polling is simple but may stall if chunks are out of order across nodes.</p></li>
-<li><p><strong>v1_ll</strong>: Work is distributed per <code class="docutils literal notranslate"><span class="pre">(expert,</span> <span class="pre">token,</span> <span class="pre">node)</span></code> triplet. Each warp picks up work as soon as any chunk flag signals. Better latency at small batch sizes; similar peak BW at large batches.</p></li>
+<li><p>Access to the target node (for example <code class="docutils literal notranslate"><span class="pre">&lt;node-name&gt;</span></code>), including an active reservation if required by the cluster scheduler.</p></li>
+<li><p>Mori and SGLang checkouts on the node.</p></li>
+<li><p>Access to a checkpoint directory when running with real weights.</p></li>
+<li><p>Docker privileges on the node.</p></li>
 </ul>
 </section>
+<section id="configuration-inputs">
+<h2>Configuration Inputs<a class="headerlink" href="#configuration-inputs" title="Link to this heading"></a></h2>
+<section id="script-constants">
+<h3>Script constants<a class="headerlink" href="#script-constants" title="Link to this heading"></a></h3>
+<p>The script declares a few host-specific defaults near the top. Update them before running if your environment differs.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Purpose</p></th>
+<th class="head"><p>Typical override</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">USER_HOME</span></code></p></td>
+<td><p>Home directory mounted into the container.</p></td>
+<td><p>Set to your <code class="docutils literal notranslate"><span class="pre">${HOME}</span></code> path on the node.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">NFS_BASE</span></code></p></td>
+<td><p>Base path containing the repositories.</p></td>
+<td><p>Point to the shared filesystem path that holds Mori and SGLang.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">EXTRA_MOUNTS</span></code></p></td>
+<td><p>Additional <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">run</span></code> bind mounts.</p></td>
+<td><p>Remove entries that do not exist or add the host paths you require.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DOCKER_IMAGE</span></code></p></td>
+<td><p>ROCm container tag.</p></td>
+<td><p>Change if you need a different toolchain.</p></td>
+</tr>
+</tbody>
+</table>
 </section>
-<hr class="docutils" />
-<section id="sanity-checks-from-hardware-counters-optional">
-<h2>Sanity Checks from Hardware Counters (optional)<a class="headerlink" href="#sanity-checks-from-hardware-counters-optional" title="Link to this heading"></a></h2>
-<p>If you have access to <code class="docutils literal notranslate"><span class="pre">rocprof</span></code> or equivalent:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>rocprof<span class="w"> </span>--stats<span class="w"> </span>--hip-trace<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--counter<span class="w"> </span><span class="s2">"TCC_EA_RDREQ_sum,TCC_EA_WRREQ_sum"</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>python<span class="w"> </span>run_dispatch_combine.py
+<section id="runtime-environment-variables">
+<h3>Runtime environment variables<a class="headerlink" href="#runtime-environment-variables" title="Link to this heading"></a></h3>
+<p>Export the variables below to adapt the run to your environment. The script reads these values at launch time.</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Variable</p></th>
+<th class="head"><p>Default in script</p></th>
+<th class="head"><p>When to change</p></th>
+<th class="head"><p>Example</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MODEL_PATH</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/apps/data/models/DeepSeek-V3-0324</span></code></p></td>
+<td><p>Real checkpoint location.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/apps/data/models/DeepSeek-V3-0324</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SGLANG_REPO</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">${NFS_BASE}/sglang</span></code></p></td>
+<td><p>Local SGLang checkout.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/apps/ditian12/sglang</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MORI_REPO</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">${NFS_BASE}/mori</span></code></p></td>
+<td><p>Local Mori checkout.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/apps/ditian12/mori</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RESULTS_DIR</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">${USER_HOME}/umbp_single_node_results</span></code></p></td>
+<td><p>Where to store logs.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">/tmp/umbp_results</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ENABLE_DP</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+<td><p>Enable DP+EP mode.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">true</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">DP_SIZE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">8</span></code></p></td>
+<td><p>Data parallel group size.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">4</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">EP_SIZE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">8</span></code></p></td>
+<td><p>Expert parallel group size.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">2</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TP_SIZE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">8</span></code></p></td>
+<td><p>Tensor parallel group size.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">8</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">START_UMBP_MASTER</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">true</span></code></p></td>
+<td><p>Disable if you already manage the master.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_MASTER_ADDRESS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">127.0.0.1:15558</span></code></p></td>
+<td><p>Master listener address.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;host-ip&gt;:15558</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_NODE_ADDRESS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">127.0.0.1</span></code></p></td>
+<td><p>IP advertised to clients.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">&lt;node-ip&gt;</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_IO_ENGINE_PORT</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">16000</span></code></p></td>
+<td><p>Hicache IO engine port.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">16010</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_PEER_SERVICE_PORT</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">17000</span></code></p></td>
+<td><p>Peer service port.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">17010</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">UMBP_SSD_STAGING_BYTES</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">268435456</span></code> (256 MiB)</p></td>
+<td><p>Size of the dedicated remote-SSD read staging buffer. Allocated <strong>only</strong> when SSD is enabled (DRAM-only runs allocate nothing and are unaffected). Raise for large-KV models so each read slot fits one key’s value.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">268435456</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">USE_DUMMY_WEIGHTS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">false</span></code></p></td>
+<td><p>Skip checkpoint validation.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">true</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MEM_FRACTION_STATIC</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0.7</span></code></p></td>
+<td><p>Fraction reserved for static allocations.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0.6</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">PROBE_MAX_TIME</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">300</span></code></p></td>
+<td><p>Timeout for probe request in seconds.</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">600</span></code></p></td>
+</tr>
+</tbody>
+</table>
+<p>The script also respects <code class="docutils literal notranslate"><span class="pre">MORI_BRANCH</span></code>, <code class="docutils literal notranslate"><span class="pre">SGLANG_BRANCH</span></code>, and <code class="docutils literal notranslate"><span class="pre">MORI_PIP_FLAGS</span></code> if they are supplied.</p>
+</section>
+</section>
+<section id="launch-steps">
+<h2>Launch Steps<a class="headerlink" href="#launch-steps" title="Link to this heading"></a></h2>
+<ol class="arabic">
+<li><p><strong>SSH to the target node</strong>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>ssh<span class="w"> </span>-o<span class="w"> </span><span class="nv">StrictHostKeyChecking</span><span class="o">=</span>no<span class="w"> </span>&lt;node-name&gt;
 </pre></div>
 </div>
-<p>Cross-check the <code class="docutils literal notranslate"><span class="pre">TCC_EA_WRREQ</span></code> write request count against
-<code class="docutils literal notranslate"><span class="pre">total_sends</span> <span class="pre">=</span> <span class="pre">curRankNumToken</span> <span class="pre">/</span> <span class="pre">warpSize</span> <span class="pre">*</span> <span class="pre">nQpPerPe</span> <span class="pre">*</span> <span class="pre">(nNodes</span> <span class="pre">-</span> <span class="pre">1)</span></code>.</p>
-<p>For RDMA-specific counters (NIC-side), use the vendor tool (e.g., <code class="docutils literal notranslate"><span class="pre">perfquery</span></code> for InfiniBand or
-the AMD NIC perf tools) to observe port-level <code class="docutils literal notranslate"><span class="pre">PortXmitData</span></code> and <code class="docutils literal notranslate"><span class="pre">PortRcvData</span></code> during the run.
-If <code class="docutils literal notranslate"><span class="pre">PortXmitData</span> <span class="pre">/</span> <span class="pre">iteration_time</span></code> ≈ rated NIC bandwidth, the link is saturated.</p>
-</section>
-<hr class="docutils" />
-<section id="summary">
-<h2>Summary<a class="headerlink" href="#summary" title="Link to this heading"></a></h2>
-<p>To determine if RDMA is fully utilized:</p>
-<ol class="arabic simple">
-<li><p><strong>Collect a trace</strong> with the built-in kernel profiler.</p></li>
-<li><p><strong>Read <code class="docutils literal notranslate"><span class="pre">dispatch_inter_node_send</span></code> duration</strong> from the text summary.</p></li>
-<li><p><strong>Compute theoretical bytes</strong> sent (tokens × xferBytes × (nNodes − 1)).</p></li>
-<li><p><strong>Divide</strong> to get observed GB/s; compare to the NIC’s rated bandwidth.</p></li>
-<li><p>If observed &lt; rated by &gt;20%, look for: too few QPs, too small batch, or the recv side
-blocking the send side (check <code class="docutils literal notranslate"><span class="pre">recv</span></code> span vs. <code class="docutils literal notranslate"><span class="pre">send</span></code> span ratio).</p></li>
+</li>
+<li><p><strong>Review script constants</strong>:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sed<span class="w"> </span>-n<span class="w"> </span><span class="s1">'1,120p'</span><span class="w"> </span>run_umbp_single_node_hicache.sh
+</pre></div>
+</div>
+<p>Update <code class="docutils literal notranslate"><span class="pre">USER_HOME</span></code>, <code class="docutils literal notranslate"><span class="pre">NFS_BASE</span></code>, <code class="docutils literal notranslate"><span class="pre">EXTRA_MOUNTS</span></code>, and <code class="docutils literal notranslate"><span class="pre">DOCKER_IMAGE</span></code> if the defaults do not match your environment.</p>
+</li>
+<li><p><strong>Export runtime variables</strong> (fill placeholders with your values):</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MODEL_PATH</span><span class="o">=</span>&lt;path-to-model-checkpoints&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">SGLANG_REPO</span><span class="o">=</span>&lt;path-to-sglang&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">MORI_REPO</span><span class="o">=</span>&lt;path-to-mori&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">RESULTS_DIR</span><span class="o">=</span>&lt;path-for-results&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">ENABLE_DP</span><span class="o">=</span>&lt;true<span class="p">|</span>false&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">DP_SIZE</span><span class="o">=</span>&lt;dp-size&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">EP_SIZE</span><span class="o">=</span>&lt;ep-size&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">TP_SIZE</span><span class="o">=</span>&lt;tp-size&gt;
+<span class="nb">export</span><span class="w"> </span><span class="nv">START_UMBP_MASTER</span><span class="o">=</span><span class="nb">true</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">UMBP_NODE_ADDRESS</span><span class="o">=</span><span class="k">$(</span>hostname<span class="w"> </span>-I<span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span><span class="s1">'{print $1}'</span><span class="k">)</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">USE_DUMMY_WEIGHTS</span><span class="o">=</span><span class="nb">false</span>
+</pre></div>
+</div>
+<p>Add any other overrides from the table above as needed.</p>
+</li>
+<li><p><strong>Run the script</strong> with the desired weight mode:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>bash<span class="w"> </span>run_umbp_single_node_hicache.sh<span class="w"> </span>--real-weights
+<span class="c1"># or</span>
+bash<span class="w"> </span>run_umbp_single_node_hicache.sh<span class="w"> </span>--use-dummy-weights
+</pre></div>
+</div>
+<p>The script will:</p>
+<ul class="simple">
+<li><p>Start or recycle the <code class="docutils literal notranslate"><span class="pre">umbp-single-node</span></code> container.</p></li>
+<li><p>Rebuild Mori with <code class="docutils literal notranslate"><span class="pre">BUILD_UMBP=ON</span></code> via <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span></code>.</p></li>
+<li><p>Compute network interface settings for NCCL/Gloo.</p></li>
+<li><p>Launch the SGLang server with the configured parallelism values and hicache settings.</p></li>
+</ul>
+</li>
+<li><p><strong>Monitor the probe and cleanup</strong>:</p>
+<ul class="simple">
+<li><p>The script waits up to one hour for <code class="docutils literal notranslate"><span class="pre">http://127.0.0.1:30000/health</span></code> to report ready.</p></li>
+<li><p>It issues a probe request and stores the output in <code class="docutils literal notranslate"><span class="pre">${RESULTS_DIR}/probe_response.json</span></code>.</p></li>
+<li><p>On success, the script terminates the SGLang server and UMBP master, leaving artifacts in <code class="docutils literal notranslate"><span class="pre">${RESULTS_DIR}</span></code>.</p></li>
+</ul>
+</li>
 </ol>
+</section>
+<section id="core-dumps">
+<h2>Core Dumps<a class="headerlink" href="#core-dumps" title="Link to this heading"></a></h2>
+<p>By default the container routes crashes through Apport (<code class="docutils literal notranslate"><span class="pre">/usr/share/apport/apport</span></code>). If raw core files are required, disable Apport inside the container and set:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sysctl<span class="w"> </span>-w<span class="w"> </span>kernel.core_pattern<span class="o">=</span>/nfs/users/&lt;user&gt;/cores/core.%e.%p
+<span class="nb">ulimit</span><span class="w"> </span>-c<span class="w"> </span>unlimited
+</pre></div>
+</div>
+<p>Make sure the directory exists and has enough space.</p>
+</section>
+<section id="troubleshooting">
+<h2>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p><strong>Container launch</strong>: <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">ps</span></code> should show <code class="docutils literal notranslate"><span class="pre">umbp-single-node</span></code>. If it exits immediately, check <code class="docutils literal notranslate"><span class="pre">docker</span> <span class="pre">logs</span></code>.</p></li>
+<li><p><strong>Server logs</strong>: Available under <code class="docutils literal notranslate"><span class="pre">${RESULTS_DIR}/server_*.log</span></code>.</p></li>
+<li><p><strong>UMBP master logs</strong>: Saved alongside server logs when <code class="docutils literal notranslate"><span class="pre">START_UMBP_MASTER=true</span></code>.</p></li>
+<li><p><strong>Model validation</strong>: The script validates that <code class="docutils literal notranslate"><span class="pre">MODEL_PATH</span></code> contains <code class="docutils literal notranslate"><span class="pre">model-*.safetensors</span></code> when running with real weights.</p></li>
+<li><p><strong>Probe failures</strong>: Inspect the tail of the server log; the script prints it automatically on errors.</p></li>
+<li><p><strong>Remote SSD reads silently recompute (<code class="docutils literal notranslate"><span class="pre">size_too_large</span></code>)</strong>: A remote SSD read must fit a key’s whole value into one slot, where <code class="docutils literal notranslate"><span class="pre">per_slot</span> <span class="pre">=</span> <span class="pre">ssd_staging_buffer_size</span> <span class="pre">/</span> <span class="pre">ssd_staging_buffer_slots</span></code> (defaults 256 MiB / 16 = 16 MiB). The single-key page KV for an MLA model ≈ <code class="docutils literal notranslate"><span class="pre">page_size</span> <span class="pre">×</span> <span class="pre">(kv_lora_rank</span> <span class="pre">+</span> <span class="pre">qk_rope_head_dim)</span> <span class="pre">×</span> <span class="pre">dtype_bytes</span> <span class="pre">×</span> <span class="pre">num_layers</span></code> (DeepSeek-V3 5-layer ≈ 360 KB; full R1/V3 61-layer ≈ 4.5 MB). If <code class="docutils literal notranslate"><span class="pre">per_slot</span></code> is smaller, the read is dropped and the block is recomputed — requests don’t error, but <code class="docutils literal notranslate"><span class="pre">mori_umbp_ssd_read_total{status=&quot;size_too_large&quot;}</span></code> climbs and hit rate/throughput fall. Fix: raise <code class="docutils literal notranslate"><span class="pre">UMBP_SSD_STAGING_BYTES</span></code> or lower <code class="docutils literal notranslate"><span class="pre">ssd_staging_buffer_slots</span></code> so <code class="docutils literal notranslate"><span class="pre">per_slot</span> <span class="pre">≥</span></code> the single-key page KV. (<code class="docutils literal notranslate"><span class="pre">ssd_staging_buffer_size</span></code> is allocated only when SSD is enabled, separate from the general <code class="docutils literal notranslate"><span class="pre">staging_buffer_size</span></code>.)</p></li>
+</ul>
+<p>Refer back to this document whenever the single-node smoke test needs to be run or automated. For the original skill instructions see <code class="docutils literal notranslate"><span class="pre">/home/ditian12/.codex/skills/umbp-single-node-launcher/SKILL.md</span></code>.</p>
 </section>
 </section>
 
