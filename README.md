@@ -329,3 +329,4 @@ pre-commit run --all-files
 ```
 
 Pre-commit automatically checks code formatting, linting, license headers, and other quality checks on commit. To skip checks when necessary: `git commit --no-verify`
+<!-- AMDPilot mirror canary -->
